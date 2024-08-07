@@ -18,10 +18,12 @@ package com.weibo.rill.flow.olympicene.traversal.mappings;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
-import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.googlecode.aviator.AviatorEvaluator;
-import com.jayway.jsonpath.*;
+import com.jayway.jsonpath.Configuration;
+import com.jayway.jsonpath.InvalidPathException;
+import com.jayway.jsonpath.JsonPath;
+import com.jayway.jsonpath.Option;
 import com.weibo.rill.flow.interfaces.model.mapping.Mapping;
 import com.weibo.rill.flow.olympicene.traversal.serialize.DAGTraversalSerializer;
 import lombok.extern.slf4j.Slf4j;
@@ -30,13 +32,17 @@ import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.factory.annotation.Value;
 
 import java.math.BigDecimal;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @Slf4j
 public class JSONPathInputOutputMapping implements InputOutputMapping, JSONPath {
     Configuration conf = Configuration.builder().options(Option.DEFAULT_PATH_LEAF_TO_NULL).build();
+    private static final Pattern JSONPATH_PATTERN = Pattern.compile("\\[\"(.*?)\"]|\\['(.*?)']");
 
     @Value("${rill.flow.function.trigger.uri}")
     private String rillFlowFunctionTriggerUri;
@@ -55,28 +61,14 @@ public class JSONPathInputOutputMapping implements InputOutputMapping, JSONPath 
         map.put("output", output);
 
         List<Mapping> mappingRules = rules.stream()
-                .filter(rule -> StringUtils.isNoneBlank(rule.getSource()) && StringUtils.isNoneBlank(rule.getTarget()))
+                .filter(rule -> (StringUtils.isNotBlank(rule.getSource()) || StringUtils.isNotBlank(rule.getTransform()))
+                        && StringUtils.isNotBlank(rule.getTarget()))
                 .toList();
         for (Mapping mapping : mappingRules) {
             boolean intolerance = mapping.getTolerance() != null && !mapping.getTolerance();
             try {
                 String source = mapping.getSource();
-                Object sourceValue = null;
-                String[] infos = source.split("\\.");
-                if (source.startsWith("$.tasks.") && infos.length > 3) {
-                    String taskName = infos[2];
-                    String key = infos[3];
-                    if (key.equals("trigger_url") || key.startsWith("trigger_url?")) {
-                        sourceValue = serverHost + rillFlowFunctionTriggerUri + "?execution_id=" + context.get("flow_execution_id") + "&task_name=" + taskName;
-                        String[] queryInfos = source.split("\\?");
-                        if (queryInfos.length > 0) {
-                            sourceValue += '&' + queryInfos[1];
-                        }
-                    }
-                } else {
-                    sourceValue = source.startsWith("$") ? getValue(map, source) : parseSource(source);
-                }
-
+                Object sourceValue = calculateSourceValue((String) context.get("flow_execution_id"), source, map);
                 Object transformedValue = transformSourceValue(sourceValue, context, input, output, mapping.getTransform());
 
                 if (transformedValue != null) {
@@ -89,6 +81,32 @@ public class JSONPathInputOutputMapping implements InputOutputMapping, JSONPath 
                 }
             }
         }
+    }
+
+    private Object calculateSourceValue(String executionId, String source, Map<String, Object> map) {
+        if (StringUtils.isBlank(source)) {
+            return null;
+        }
+        String[] infos = source.split("\\.");
+        if (source.startsWith("$.tasks.") && infos.length > 3) {
+            String taskName = infos[2];
+            String key = infos[3];
+            return tryToGenerateTriggerUrl(executionId, source, key, taskName);
+        } else {
+            return source.startsWith("$") ? getValue(map, source) : parseSource(source);
+        }
+    }
+
+    private Object tryToGenerateTriggerUrl(String executionId, String source, String key, String taskName) {
+        if (!key.equals("trigger_url") && !key.startsWith("trigger_url?")) {
+            return null;
+        }
+        Object sourceValue = serverHost + rillFlowFunctionTriggerUri + "?execution_id=" + executionId + "&task_name=" + taskName;
+        String[] queryInfos = source.split("\\?");
+        if (queryInfos.length > 1) {
+            sourceValue += '&' + queryInfos[1];
+        }
+        return sourceValue;
     }
 
     public Object transformSourceValue(Object sourceValue, Map<String, Object> context, Map<String, Object> input,
@@ -177,19 +195,29 @@ public class JSONPathInputOutputMapping implements InputOutputMapping, JSONPath 
             return null;
         }
 
-        List<String> intermediateRoute = Lists.newArrayList();
-        for (int i = 0; i < path.length(); i++) {
-            if (path.charAt(i) == '.') {
-                intermediateRoute.add(path.substring(0, i));
+        String jsonPath = JsonPath.compile(path).getPath();
+        List<String> jsonPathParts = new ArrayList<>();
+        Matcher matcher = JSONPATH_PATTERN.matcher(jsonPath);
+        while (matcher.find()) {
+            if (matcher.group(1) != null) {
+                jsonPathParts.add(matcher.group(1));
+            } else if (matcher.group(2) != null) {
+                jsonPathParts.add(matcher.group(2));
             }
         }
 
-        DocumentContext context = JsonPath.using(conf).parse(map);
-        for (String route : intermediateRoute) {
-            if (context.read(route) == null) {
-                context.set(route, new HashMap<>());
+        jsonPathParts.remove(jsonPathParts.size() - 1);
+
+        Object current = map;
+        for (String part: jsonPathParts) {
+            if (current instanceof Map) {
+                Map<String, Object> mapCurrent = (Map<String, Object>) current;
+                current = mapCurrent.computeIfAbsent(part, k -> new HashMap<>());
+            } else {
+                break;
             }
         }
+
         return JsonPath.using(conf).parse(map).set(path, value).json();
     }
 
